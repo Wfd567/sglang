@@ -177,6 +177,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming completion request"""
+        await self.tokenizer_manager.validate_request_for_streaming(adapted_request)
         return StreamingResponse(
             self._generate_completion_stream(adapted_request, request, raw_request),
             media_type="text/event-stream",

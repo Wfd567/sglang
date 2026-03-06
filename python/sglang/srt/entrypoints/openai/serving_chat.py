@@ -596,7 +596,7 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming chat completion request"""
-        await self.tokenizer_manager.validate_request(adapted_request, raw_request)
+        await self.tokenizer_manager.validate_request_for_streaming(adapted_request)
         return StreamingResponse(
             self._generate_chat_stream(adapted_request, request, raw_request),
             media_type="text/event-stream",

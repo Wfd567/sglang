@@ -526,11 +526,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 async for response in self._handle_batch_request(obj, request):
                     yield response
 
-    async def validate_request(
+    async def validate_request_for_streaming(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
     ) -> None:
+        """Validate request for streaming without creating state or acquiring LoRA references.
+
+        This method is designed to be called before streaming starts, so that validation
+        errors can be returned with proper HTTP status codes (e.g., 400) instead of being
+        sent through SSE after the stream has started.
+
+        Unlike generate_request, this method:
+        - Does NOT create rid_to_state (avoids KeyError)
+        - Does NOT acquire LoRA references (avoids reference leak)
+        - Does NOT send requests to scheduler
+
+        Args:
+            obj: The request object to validate
+
+        Raises:
+            ValueError: If validation fails (e.g., context length exceeded)
+        """
         self.auto_create_handle_loop()
 
         obj.normalize_batch_and_arguments()
@@ -552,12 +568,138 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            await self._validate_and_resolve_lora(obj)
+            if obj.lora_path:
+                if not self.server_args.enable_lora:
+                    first_adapter = (
+                        obj.lora_path
+                        if isinstance(obj.lora_path, str)
+                        else next((a for a in obj.lora_path if a), None)
+                    )
+                    raise ValueError(
+                        f"LoRA adapter '{first_adapter}' was requested, but LoRA is not enabled. "
+                        "Please launch the server with --enable-lora flag and preload adapters "
+                        "using --lora-paths or /load_lora_adapter endpoint."
+                    )
 
             if obj.is_single:
-                await self._tokenize_one_request(obj)
+                await self._tokenize_and_validate_only(obj)
             else:
-                await self._batch_tokenize_and_process(obj)
+                await self._batch_tokenize_and_validate_only(obj)
+
+    async def _tokenize_and_validate_only(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ) -> None:
+        """Tokenize and validate request without creating tokenized object or state.
+
+        This method performs tokenization and validation but does NOT:
+        - Create rid_to_state entry
+        - Create TokenizedGenerateReqInput/TokenizedEmbeddingReqInput
+        - Acquire LoRA references
+
+        Args:
+            obj: The request object to validate
+
+        Raises:
+            ValueError: If validation fails
+        """
+        input_text = obj.text
+        token_type_ids = None
+        is_cross_encoder_request = (
+            isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
+        )
+
+        if obj.input_embeds is not None:
+            if not self.server_args.disable_radix_cache:
+                raise ValueError(
+                    "input_embeds is provided while disable_radix_cache is False. "
+                    "Please add `--disable-radix-cache` when you launch the server "
+                    "if you want to use input_embeds as inputs."
+                )
+            input_ids = obj.input_ids
+        elif obj.input_ids is not None:
+            input_ids = obj.input_ids
+        else:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "The engine initialized with skip_tokenizer_init=True cannot "
+                    "accept text prompts. Please provide input_ids or re-initialize "
+                    "the engine with skip_tokenizer_init=False."
+                )
+
+            if not input_text and self.mm_processor and obj.contains_mm_input():
+                input_ids = []
+            else:
+                input_ids, token_type_ids = await self._tokenize_texts(
+                    input_text, is_cross_encoder_request
+                )
+
+        if self.mm_processor and obj.contains_mm_input():
+            if obj.image_data is not None and not isinstance(obj.image_data, list):
+                obj.image_data = [obj.image_data]
+            if obj.video_data is not None and not isinstance(obj.video_data, list):
+                obj.video_data = [obj.video_data]
+            if obj.audio_data is not None and not isinstance(obj.audio_data, list):
+                obj.audio_data = [obj.audio_data]
+            self._validate_mm_limits(obj)
+
+            mm_inputs = None
+
+            if (
+                not self.server_args.language_only
+                or self.server_args.encoder_transfer_backend
+                in ["zmq_to_tokenizer", "mooncake"]
+            ):
+                if self.server_args.language_only:
+                    mm_inputs = await self.mm_receiver.recv_mm_data(
+                        img_data=obj.image_data,
+                        mm_processor=self.mm_processor,
+                        prompt=(input_text or input_ids),
+                        need_wait_for_image=obj.need_wait_for_image,
+                    )
+                if mm_inputs is None:
+                    mm_inputs: Dict = await self.mm_data_processor.process(
+                        image_data=obj.image_data,
+                        audio_data=obj.audio_data,
+                        input_text_or_ids=(input_text or input_ids),
+                        request_obj=obj,
+                        max_req_input_len=self.max_req_input_len,
+                    )
+            elif (
+                self.server_args.language_only
+                and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+                and not obj.need_wait_for_image
+            ):
+                mm_inputs: Dict = await self.mm_data_processor.process(
+                    image_data=obj.image_data,
+                    audio_data=obj.audio_data,
+                    input_text_or_ids=(input_text or input_ids),
+                    request_obj=obj,
+                    max_req_input_len=self.max_req_input_len,
+                )
+
+            if mm_inputs and "input_ids" in mm_inputs:
+                input_ids = mm_inputs["input_ids"]
+        else:
+            mm_inputs = None
+
+        self._validate_one_request(obj, input_ids)
+
+    async def _batch_tokenize_and_validate_only(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ) -> None:
+        """Batch tokenize and validate without creating state.
+
+        Args:
+            obj: The batch request object to validate
+
+        Raises:
+            ValueError: If validation fails for any request in the batch
+        """
+        batch_size = obj.batch_size
+        for i in range(batch_size):
+            await self._tokenize_and_validate_only(obj[i])
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
