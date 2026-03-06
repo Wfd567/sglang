@@ -526,6 +526,39 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 async for response in self._handle_batch_request(obj, request):
                     yield response
 
+    async def validate_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ) -> None:
+        self.auto_create_handle_loop()
+
+        obj.normalize_batch_and_arguments()
+        self._set_default_priority(obj)
+        self._validate_rid(obj)
+
+        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
+            dp_size = self.server_args.dp_size
+            if dp_size <= 1 and obj.routed_dp_rank == 0:
+                logger.warning(
+                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
+                )
+            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+                raise ValueError(
+                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                )
+
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+        async with self.model_update_lock.reader_lock:
+            await self._validate_and_resolve_lora(obj)
+
+            if obj.is_single:
+                await self._tokenize_one_request(obj)
+            else:
+                await self._batch_tokenize_and_process(obj)
+
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
     ) -> InputFormat:
