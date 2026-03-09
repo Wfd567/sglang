@@ -532,48 +532,50 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ) -> None:
         """Validate request for streaming without creating state or acquiring LoRA references.
 
-        This method is designed to be called before streaming starts, so that validation
-        errors can be returned with proper HTTP status codes (e.g., 400) instead of being
-        sent through SSE after the stream has started.
+        This method creates a deep copy of the request object and validates the copy,
+        ensuring that the original object remains unmodified for generate_request().
 
         Unlike generate_request, this method:
         - Does NOT create rid_to_state (avoids KeyError)
         - Does NOT acquire LoRA references (avoids reference leak)
         - Does NOT send requests to scheduler
+        - Does NOT modify the original request object (uses deepcopy)
 
         Args:
-            obj: The request object to validate
+            obj: The original request object to validate (will NOT be modified)
 
         Raises:
             ValueError: If validation fails (e.g., context length exceeded)
         """
+        obj_copy = copy.deepcopy(obj)
+        
         self.auto_create_handle_loop()
 
-        obj.normalize_batch_and_arguments()
-        self._set_default_priority(obj)
-        self._validate_rid(obj)
+        obj_copy.normalize_batch_and_arguments()
+        self._set_default_priority(obj_copy)
+        self._validate_rid(obj_copy)
 
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
+        if isinstance(obj_copy, GenerateReqInput) and obj_copy.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
+            if dp_size <= 1 and obj_copy.routed_dp_rank == 0:
                 logger.warning(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
+                    f"routed_dp_rank={obj_copy.routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+            elif obj_copy.routed_dp_rank < 0 or obj_copy.routed_dp_rank >= dp_size:
                 raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                    f"routed_dp_rank={obj_copy.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            if obj.lora_path:
+            if obj_copy.lora_path:
                 if not self.server_args.enable_lora:
                     first_adapter = (
-                        obj.lora_path
-                        if isinstance(obj.lora_path, str)
-                        else next((a for a in obj.lora_path if a), None)
+                        obj_copy.lora_path
+                        if isinstance(obj_copy.lora_path, str)
+                        else next((a for a in obj_copy.lora_path if a), None)
                     )
                     raise ValueError(
                         f"LoRA adapter '{first_adapter}' was requested, but LoRA is not enabled. "
@@ -581,10 +583,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "using --lora-paths or /load_lora_adapter endpoint."
                     )
 
-            if obj.is_single:
-                await self._tokenize_and_validate_only(obj)
+            if obj_copy.is_single:
+                await self._tokenize_and_validate_only(obj_copy)
             else:
-                await self._batch_tokenize_and_validate_only(obj)
+                await self._batch_tokenize_and_validate_only(obj_copy)
 
     async def _tokenize_and_validate_only(
         self,
@@ -635,12 +637,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
 
         if self.mm_processor and obj.contains_mm_input():
-            if obj.image_data is not None and not isinstance(obj.image_data, list):
-                obj.image_data = [obj.image_data]
-            if obj.video_data is not None and not isinstance(obj.video_data, list):
-                obj.video_data = [obj.video_data]
-            if obj.audio_data is not None and not isinstance(obj.audio_data, list):
-                obj.audio_data = [obj.audio_data]
+            image_data = obj.image_data
+            video_data = obj.video_data
+            audio_data = obj.audio_data
+            
+            if image_data is not None and not isinstance(image_data, list):
+                image_data = [image_data]
+            if video_data is not None and not isinstance(video_data, list):
+                video_data = [video_data]
+            if audio_data is not None and not isinstance(audio_data, list):
+                audio_data = [audio_data]
+            
             self._validate_mm_limits(obj)
 
             mm_inputs = None
@@ -652,15 +659,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ):
                 if self.server_args.language_only:
                     mm_inputs = await self.mm_receiver.recv_mm_data(
-                        img_data=obj.image_data,
+                        img_data=image_data,
                         mm_processor=self.mm_processor,
                         prompt=(input_text or input_ids),
                         need_wait_for_image=obj.need_wait_for_image,
                     )
                 if mm_inputs is None:
                     mm_inputs: Dict = await self.mm_data_processor.process(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
+                        image_data=image_data,
+                        audio_data=audio_data,
                         input_text_or_ids=(input_text or input_ids),
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
@@ -671,8 +678,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 and not obj.need_wait_for_image
             ):
                 mm_inputs: Dict = await self.mm_data_processor.process(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
+                    image_data=image_data,
+                    audio_data=audio_data,
                     input_text_or_ids=(input_text or input_ids),
                     request_obj=obj,
                     max_req_input_len=self.max_req_input_len,
