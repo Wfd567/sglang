@@ -19,6 +19,8 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    SSD = auto()
+    SSD_ASYNC = auto()
     NONE = auto()
 
     @classmethod
@@ -46,8 +48,14 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_ssd(self) -> bool:
+        return self == SpeculativeAlgorithm.SSD
+
+    def is_ssd_async(self) -> bool:
+        return self == SpeculativeAlgorithm.SSD_ASYNC
+
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_ssd() or self.is_ssd_async()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -101,6 +109,12 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_ssd() or self.is_ssd_async():
+            if enable_overlap:
+                from sglang.srt.speculative.ssd_worker_v2 import SSDWorkerV2
+                return SSDWorkerV2
+            from sglang.srt.speculative.ssd_worker import SSDWorker
+            return SSDWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 
@@ -111,6 +125,8 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    SSD_DRAFT = auto()
+    SSD_VERIFY = auto()
 
 
 class SpecInput(ABC):

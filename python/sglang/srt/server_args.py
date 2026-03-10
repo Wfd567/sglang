@@ -502,6 +502,13 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
+    
+    # SSD (Speculative Speculative Decoding)
+    ssd_async: bool = False
+    ssd_fan_out: Optional[int] = None
+    ssd_jit_speculate: bool = False
+    ssd_sampler_x: Optional[float] = None
+    ssd_max_cached_sequences: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
